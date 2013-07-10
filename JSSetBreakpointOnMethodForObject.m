@@ -56,69 +56,19 @@ static Class js_class(id self, SEL _cmd)
     return class_getSuperclass(thisClass);
 }
 
-#define _GetPossibleParameterValue(index, encodedType, possibleType) do { \
-                NSUInteger parameterSize = 0; \
-                if (strcmp(parameterType, @encode(possibleType)) == 0) \
-                { \
-                    parameterSize = sizeof(possibleType); \
-                    parameterBuffer = malloc(parameterSize); \
-                    possibleType object = va_arg(args, possibleType); \
-                    *(possibleType *)parameterBuffer = object; \
-                } \
-        } while(0)
-
 /**
  This is the method that is called instead of the original selector.
  It has to do two things:
  1. Pause the debugger.
  2. Call the original implementation of the object (the one of the parent class).
 */
-static id catchEmAllMethodTrampoline(id self, SEL _cmd, ...)
+static void catchEmAllMethodTrampoline(id self, SEL _cmd, NSInvocation *invocation)
 {
     MSBreakIntoDebugger();
 
-    NSMethodSignature *methodSignature = [[self class] instanceMethodSignatureForSelector:_cmd];
-    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:methodSignature];
-    invocation.target = self;
-    invocation.selector = _cmd;
-
-    const NSUInteger numberOfArguments = methodSignature.numberOfArguments;
-    if (numberOfArguments > 2)
-    {
-        va_list args;
-        va_start(args, _cmd);
-
-        for (NSUInteger parameterIndex = 2; parameterIndex < numberOfArguments; parameterIndex++)
-        {
-            void *parameterBuffer = NULL;
-            const char *parameterType = [methodSignature getArgumentTypeAtIndex:parameterIndex];
-
-            _GetPossibleParameterValue(parameterIndex, parameterType, id);
-            _GetPossibleParameterValue(parameterIndex, parameterType, int);
-
-            NSCAssert(parameterBuffer, @"Couldn't find type for argument at index %d (%s) on method with selector %@", parameterIndex, parameterType, NSStringFromSelector(_cmd));
-
-            [invocation setArgument:parameterBuffer atIndex:(NSInteger)parameterIndex];
-        }
-    }
-
-    IMP parentInvocation = [[self class] instanceMethodForSelector:_cmd];
+    IMP parentInvocation = [[self class] instanceMethodForSelector:invocation.selector];
     // Private API: -[NSInvocation invokeUsingIMP:]
     [invocation performSelector:NSSelectorFromString(@"invokeUsingIMP:") withObject:(id)parentInvocation];
-
-    NSUInteger returnTypeSize = methodSignature.methodReturnLength;
-
-    if (returnTypeSize > 0)
-    {
-        void *returnValueBuffer = (void *)malloc(returnTypeSize);
-        [invocation getReturnValue:returnValueBuffer];
-
-        return returnValueBuffer;
-    }
-    else
-    {
-        return nil;
-    }
 }
 
 #define ADD_NEW_METHOD(class, selector, function_pointer) class_addMethod(class, selector, (IMP)function_pointer, @encode(typeof(function_pointer)));
@@ -147,7 +97,13 @@ extern void js_setBreakpointOnMethodForObject(id object, SEL selector)
         ADD_NEW_METHOD(subclass, _js_hasBreakpointsEnabledSelector(), _js_hasBreakpointsEnabled);
     }
 
-    ADD_NEW_METHOD(subclass, selector, catchEmAllMethodTrampoline);
+    Method *method = class_getInstanceMethod(object_getClass(object), selector);
+    class_addMethod(subclass, selector, _objc_msgForward, method_getTypeEncoding(method));
+
+    // XXX: It's necessary to first check if -forwardInvocation: exists.
+    // If it exists, its IMP would need to be captured and used when called with
+    // an invocation who's selector doesn't correspond to an intercepted method.
+    class_addMethod(subclass, @selector(forwardInvocation:), catchEmAllMethodTrampoline, "v@:@");
 
     // 3. Make the object of that subclass
     object_setClass(object, subclass);
