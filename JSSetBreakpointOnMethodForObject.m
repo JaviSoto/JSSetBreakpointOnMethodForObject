@@ -14,6 +14,8 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
+static void (*void_objc_msgSendSuper)(objc_super *, SEL) = objc_msgSendSuper;
+
 static BOOL _js_hasBreakpointsEnabled(id self, SEL _cmd)
 {
     return YES;
@@ -64,11 +66,60 @@ static Class js_class(id self, SEL _cmd)
 */
 static void catchEmAllMethodTrampoline(id self, SEL _cmd, NSInvocation *invocation)
 {
-    MSBreakIntoDebugger();
+    Class class = object_getClass(self);
+    Class superclass = class_getSuperclass(class);
 
-    IMP parentInvocation = [[self class] instanceMethodForSelector:invocation.selector];
-    // Private API: -[NSInvocation invokeUsingIMP:]
-    [invocation performSelector:NSSelectorFromString(@"invokeUsingIMP:") withObject:(id)parentInvocation];
+    SEL forwardInvocationSEL = @selector(forwardInvocation:);
+
+    void (^callSuperForwardInvocation)(void) = ^{
+        // Do not call -[NSObject forwardInvocation:], an exception will be raised.
+        if ([superclass instanceMethodForSelector:forwardInvocationSEL] == [NSObject instanceMethodForSelector:forwardInvocationSEL]) return;
+
+        struct objc_super super;
+        super.receiver = self;
+        super.class = superclass;
+        void_objc_msgSendSuper(&super, forwardInvocationSEL);
+    };
+
+    // Get list of methods defined only on our dynamic subclass. In most cases,
+    // this will be only the methods that js_setBreakpointOnMethodForObject()
+    // was called on.
+    unsigned int methodCount;
+    Method *methods = class_copyMethodList(class, &methodCount);
+
+    BOOL needToCallSuper = YES;
+
+    for (NSUInteger i = 0; i < methodCount; ++methodCount) {
+        Method method = methods[i];
+
+        // 1. Vet that this the method we're looking for.
+        if (sel_registerName(method_getName(method)) != invocation.selector) continue;
+
+        // 2. Vet that it been implemented with _objc_msgForward.
+        if (method_getImplementation(method) != _objc_msgForward) break;
+
+        // 3. Yes, the method we're looking for, has been implemented with
+        //    _objc_msgForward on the dynamic subclass, time to break.
+        MSBreakIntoDebugger();
+
+        // 4. Get the parent implementation for the method in question.
+        IMP parentIMP = [[self class] instanceMethodForSelector:invocation.selector];
+
+        // 5. Only invoke the parent implementation if it does not point to
+        //    _objc_msgForward, otherwise we'd create an infinite loop.
+        if (parentIMP != _objc_msgForward) {
+            needToCallSuper = NO;
+            // Private API: -[NSInvocation invokeUsingIMP:]
+            [invocation performSelector:NSSelectorFromString(@"invokeUsingIMP:") withObject:(id)parentIMP];
+        }
+
+        break;
+    }
+
+    free(methods);
+
+    // This should be unusual, but if needed, call super.
+    if (needToCallSuper) callSuperForwardInvocation();
 }
 
 #define ADD_NEW_METHOD(class, selector, function_pointer) class_addMethod(class, selector, (IMP)function_pointer, @encode(typeof(function_pointer)));
@@ -99,10 +150,6 @@ extern void js_setBreakpointOnMethodForObject(id object, SEL selector)
 
     Method *method = class_getInstanceMethod(object_getClass(object), selector);
     class_addMethod(subclass, selector, _objc_msgForward, method_getTypeEncoding(method));
-
-    // XXX: It's necessary to first check if -forwardInvocation: exists.
-    // If it exists, its IMP would need to be captured and used when called with
-    // an invocation who's selector doesn't correspond to an intercepted method.
     class_addMethod(subclass, @selector(forwardInvocation:), catchEmAllMethodTrampoline, "v@:@");
 
     // 3. Make the object of that subclass
