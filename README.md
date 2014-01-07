@@ -14,7 +14,3 @@ This uses very dangerous and scary code. Don't compile on production apps (hence
 
 ### Limited Support
 Right now it will only work with Objective-C methods that take parameters of type `id` and `int`, it's trivial to add support for other types, except for structs.
-
-
-[![Bitdeli Badge](https://d2weczhvl823v0.cloudfront.net/JaviSoto/jssetbreakpointonmethodforobject/trend.png)](https://bitdeli.com/free "Bitdeli Badge")
-
